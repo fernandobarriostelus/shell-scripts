@@ -8,24 +8,41 @@ shippy login --silent
 PASSWORD=$(shippy get secret http-preproduction-credentials --common --field=password | tr -d '\n' | base64)
 USERNAME=$(shippy get secret http-preproduction-credentials --common --field=user | tr -d '\n' | base64)
 
-# switch to non production environment in Kubernetes
-gcloud container clusters get-credentials td-private-nane1-001-np --region northamerica-northeast1 --project td-digital-gke-private-np-b2fd
+update_secrets() {
+    local cluster=$1
+    local region=$2
+    local project=$3
+    local namespaces=("${!4}")
+
+    # switch to the specified environment in Kubernetes
+    gcloud container clusters get-credentials "$cluster" --region "$region" --project "$project"
+
+    for NAMESPACE in "${namespaces[@]}"; do
+        echo "Updating secret in namespace $NAMESPACE"
+        kubectl get secret basic-auth -n "$NAMESPACE" -o json |
+            jq --arg PASSWORD "$PASSWORD" --arg USERNAME "$USERNAME" \
+                '.data.password = $PASSWORD | .data.username = $USERNAME' |
+            kubectl apply -f -
+
+        # Get the names of all deployments in the namespace
+        DEPLOYMENTS=$(kubectl get deployments -n "$NAMESPACE" -o jsonpath='{.items[*].metadata.name}')
+
+        # Restart each deployment
+        for DEPLOYMENT in $DEPLOYMENTS; do
+            echo "Restarting deployment $DEPLOYMENT"
+            # This subcommand is used to restart the pods managed by a deployment.
+            # It triggers a rolling restart of the deployment, which means the pods
+            # will be restarted one by one to ensure minimal downtime.
+            kubectl rollout restart deployment "$DEPLOYMENT" -n "$NAMESPACE"
+        done
+
+    done
+}
 
 NAMESPACES=("koodo-commerce-shell" "sod-commerce-shell-telus" "koodo-checkout-shell" "sod-checkout-shell-telus")
-for NAMESPACE in "${NAMESPACES[@]}"; do
-    echo "Running for the namespace: $NAMESPACE"
-    kubectl get secret basic-auth -n "$NAMESPACE" -o json |
-        jq --arg PASSWORD "$PASSWORD" --arg USERNAME "$USERNAME" \
-            '.data.password = $PASSWORD | .data.username = $USERNAME' |
-        kubectl apply -f -
-done
 
-# switch to production environment in Kubernetes
-gcloud container clusters get-credentials td-private-nane1-001-pr --region northamerica-northeast1 --project td-digital-gke-private-pr-d062
+# Update secrets in non-production environment
+update_secrets "td-private-nane1-001-np" "northamerica-northeast1" "td-digital-gke-private-np-b2fd" NAMESPACES[@]
 
-for NAMESPACE in "${NAMESPACES[@]}"; do
-    kubectl get secret basic-auth -n "$NAMESPACE" -o json |
-        jq --arg PASSWORD "$PASSWORD" --arg USERNAME "$USERNAME" \
-            '.data.password = $PASSWORD | .data.username = $USERNAME' |
-        kubectl apply -f -
-done
+# Update secrets in production environment
+update_secrets "td-private-nane1-001-pr" "northamerica-northeast1" "td-digital-gke-private-pr-d062" NAMESPACES[@]
